@@ -32,6 +32,28 @@ UNIT_DEST=${JEV_UNIT_DEST:-$HOME/.config/systemd/user/$UNIT_NAME}
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'install: %s\n' "$*" >&2; exit 1; }
 
+# True when a path is inside a directory that systemd --user actually loads units
+# from. Used to scope the "do not clobber a running unit" guard so that a scratch
+# JEV_UNIT_DEST is treated as an ordinary file rather than as the live unit.
+in_systemd_unit_dir() {
+    case "${1:-}" in
+        /etc/systemd/user/*|/usr/lib/systemd/user/*|/lib/systemd/user/*|/run/systemd/user/*)
+            return 0 ;;
+    esac
+    # $HOME/.config/systemd/user, resolved both ways because XDG_CONFIG_HOME may
+    # be unset and ~ may be a symlink.
+    _base="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    case "$1" in
+        "$_base"/*) return 0 ;;
+    esac
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        case "$1" in
+            "$HOME"/.config/systemd/user/*) return 0 ;;
+        esac
+    fi
+    return 1
+}
+
 # ---- 1. get the source ---------------------------------------------------------
 if [ -n "${JEV_LOCAL_DIR:-}" ]; then
     SRC=$(cd "$JEV_LOCAL_DIR" && pwd)
@@ -242,7 +264,16 @@ UNIT_SRC=jev-style-decision.service
 
 # The guard. Renames only the DESTINATION (and the name asked of systemctl), never
 # the repo filename, so the substitution below still reads a real file.
-if [ -f "$UNIT_DEST" ] && systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+#
+# Scoped to a real systemd unit directory on purpose. Asking "is this name active"
+# alone is not enough: with JEV_UNIT_DEST pointed at a scratch file -- which is the
+# supported way to test this installer without touching the live box -- the name is
+# still active (the live service holds it) and the guard would redirect a scratch
+# install to <unit>.new for no reason. So the destination must be somewhere systemd
+# actually loads units from AND the name must be active; a scratch file is simply a
+# file, and a normal install may replace it freely.
+if [ -f "$UNIT_DEST" ] && in_systemd_unit_dir "$UNIT_DEST" && \
+   systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
     _bak="$UNIT_DEST.bak.$(date +%Y%m%d-%H%M%S)"
     cp -p "$UNIT_DEST" "$_bak"
     say "== $UNIT_NAME is ACTIVE right now -- not replacing it."

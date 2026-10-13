@@ -11,11 +11,13 @@ judgments, no API key.
 * The extension (`extension/`) registers the provider with an explicit `baseUrl`,
   which is the mechanism that actually retargets the judge role.
 * `systemd/jev-style-decision.service` runs it as a `--user` unit, so the service
-  survives logout and comes back after a reboot.
+  survives logout and comes back after a reboot. The committed file is portable
+  (`%h`, no `MemoryMax`); the installer writes a `MemoryMax` measured on the
+  machine it installs to.
 
-> **Not pushed anywhere yet.** This repository has a single local commit and no
-> remote. Point `install.sh`'s `JEV_REPO_URL` at your own fork/gist before using
-> the one-line curl installer. (See "Uninstall" for how to remove it.)
+> **Published:** <https://github.com/7n1m4/jev> (branch `main`). The 505 MiB
+> model is **not** in the repo — see "Fetch the model" below. (See "Uninstall"
+> for how to remove it.)
 
 ## What it is
 
@@ -163,6 +165,12 @@ systemctl --user daemon-reload
 systemctl --user enable --now jev-style-decision
 ```
 
+**A hand-installed unit is not identical to an installed one:** `install.sh`
+additionally writes a `MemoryMax` line computed from *that machine's* measured
+cgroup (below), and substitutes the install path for `%h/...`. A plain `cp`
+gives you the committed file, which carries no `MemoryMax` and therefore runs
+unbounded.
+
 The committed unit is path-agnostic: it pins `Environment=JEV_LOCAL_DIR` to
 `~/.local/share/jev-local` (which is what `install.sh` clones into) and expands
 `${JEV_LOCAL_DIR}` in `ExecStart`, so pointing the unit at a different checkout is
@@ -195,16 +203,22 @@ Two things worth knowing before editing it:
 * **Preflight runs before the port binds.** A missing model, a sha256 mismatch, a
   missing `readout_config.json` or a failed scorer probe all exit non-zero with
   a precise reason, and `Restart=on-failure` retries with a graduated backoff.
-  So a fresh install with no model downloaded is *expected* to sit in
-  `activating (auto-restart)` until you fetch the GGUF — check
-  `journalctl --user -u jev-style-decision -n 50` for which check failed.
-* **MemoryMax is deliberately not set.** A ceiling is only as good as its
-  measurement, and a ceiling measured on one box silently becomes too small
-  elsewhere — where it turns a healthy daemon into a start-limit-hit loop. The
-  unit's comment records this box's measured cgroup (`memory.current` ~881 MiB,
-  memory.peak ~881 MiB, 0 OOM events) and the recipe for sizing one yourself.
-  `OOMPolicy=stop` is set so that *if* you add a limit, the policy is
-  kill-and-restart rather than throttle.
+  `install.sh` also refuses to install anything until the model and the scorer's
+  python module are present, precisely so you never get a unit in a restart loop
+  over a missing file.
+* **MemoryMax is generated at install time, never committed.** `MemoryMax=${VAR}`
+  is not an option: systemd rejects it with `Invalid memory limit, ignoring` and
+  silently uses infinity (size-parsing directives are evaluated before the
+  environment is applied). So the committed file carries no `MemoryMax`, and
+  `install.sh` writes one computed from the cgroup's own measured `memory.peak`
+  (+73 MiB kernel charge +474 MiB for evictable file pages, rounded up to a
+  16 MiB step) after a successful start. The full measured arithmetic — process
+  counters vs cgroup counters, and why the cgroup number is ~500 MiB *below* the
+  ps VmHWM sum — is in the unit's comment block, which is the source of the
+  recipe. `OOMPolicy=stop` is committed so that if you add or remove a limit the
+  policy is kill-and-restart, not throttle. Drop the generated line to run
+  unbounded, or change it with
+  `systemctl --user set-property jev-style-decision MemoryMax=<size>`.
 
 Optional per-machine path overrides go in an `EnvironmentFile` rather than in
 the unit, so upgrading the repo never conflicts with your local edits:
@@ -226,16 +240,27 @@ mkdir -p ~/.config/jev-local
 ```
 
 This clones/updates the repo into `~/.local/share/jev-local`, builds the scorer if
-missing, and symlinks the extension into
-`~/.omp/plugins/node_modules/jev-local`. Because `extension/package.json` declares
-an `omp.extensions` manifest, omp auto-discovers it; no config edit is required.
-It also installs and enables the systemd user unit (see above).
+missing, preflights the model + scorer module, links the extension with
+`omp plugin link`, and installs + enables the systemd user unit (see above).
+
+The link is done with **`omp plugin link`, not a bare `ln -s`**, because the bare
+symlink silently does not work: `getEnabledPlugins`
+(`packages/coding-agent/src/extensibility/plugins/loader.ts:244`) takes the union
+of `package.json#dependencies` and `omp-plugins.lock.json#plugins`, and a
+lockfile-only entry survives *only* when its `node_modules` entry is a symlink
+(loader.ts:169). A hand-made symlink writes no lockfile entry, so omp filters the
+plugin out as a stale lockfile entry and it never loads — no error, nothing in
+`omp plugin list`. `omp plugin link` writes both halves.
 
 Verify the link:
 
 ```sh
-ls -l ~/.omp/plugins/node_modules/jev-local
+ls -l ~/.omp/plugins/node_modules/jev-local     # the symlink
+omp plugin list                                 # the lockfile entry — this is the real check
 ```
+
+The lockfile entry is what makes it discoverable, so the second command is the one
+that proves the install worked.
 
 The extension registers the `typesafe` provider with `baseUrl` pointing at
 `http://127.0.0.1:61021` (override with `JEV_BASE_URL`).

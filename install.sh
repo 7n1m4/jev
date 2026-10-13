@@ -1,16 +1,19 @@
 #!/bin/sh
 # jev-local installer (one command, idempotent).
 #
-#   curl -fsSL https://raw.githubusercontent.com/<you>/jev-local/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/7n1m4/jev/main/install.sh | sh
 #   ./install.sh                 # install from a local clone
-#   JEV_REPO_URL=https://github.com/<you>/jev-local.git ./install.sh
+#   JEV_REPO_URL=https://github.com/7n1m4/jev.git ./install.sh
 #   JEV_LOCAL_DIR=/path/to/clone ./install.sh     # install from a checkout on disk
 #
 # What it does:
 #   1. clone or update the repo into ~/.local/share/jev-local (unless JEV_LOCAL_DIR)
 #   2. build the CPU-only scorer if the binary is missing
-#   3. link the extension into ~/.omp/plugins/node_modules/jev-local, which omp's
-#      package.json manifest (omp.extensions / pi.extensions) auto-discovers
+#   2b. preflight: refuse to continue if the model or the scorer's python module
+#       is missing (both gitignored, both required, and a missing model would
+#       otherwise leave a systemd unit in a restart loop)
+#   3. link the extension with `omp plugin link`, which registers it in
+#      omp-plugins.lock.json -- a bare symlink is silently skipped by omp
 #   4. install + enable the systemd --user unit (if systemctl is available)
 #   5. print the one ~/.omp/agent/config.yml edit that routes the judge role here
 #
@@ -19,7 +22,7 @@
 
 set -eu
 
-REPO_URL=${JEV_REPO_URL:-https://github.com/<you>/jev-local.git}
+REPO_URL=${JEV_REPO_URL:-https://github.com/7n1m4/jev.git}
 INSTALL_DIR=${JEV_INSTALL_DIR:-$HOME/.local/share/jev-local}
 EXT_DIR=${JEV_EXT_DIR:-$HOME/.omp/plugins/node_modules/jev-local}
 UNIT_NAME=jev-style-decision.service
@@ -58,14 +61,114 @@ else
     say "   Install cmake + a C++ toolchain, then run: sh $SRC/scorer/build.sh"
 fi
 
-# ---- 3. link the extension so omp discovers it --------------------------------
-say "== linking extension into $EXT_DIR"
-mkdir -p "$(dirname "$EXT_DIR")"
-if [ -L "$EXT_DIR" ] || [ -d "$EXT_DIR" ]; then
-    rm -rf "$EXT_DIR"
+# ---- 2b. preflight: the pieces a fresh clone does NOT have --------------------
+# assets/, scorer/py/ and scorer/jev-gguf-scores are all gitignored on purpose
+# (the model is 505 MiB, the scorer is a build output, py/ is upstream source),
+# so a fresh clone can pass "git clone" and still be unrunnable. The hard
+# requirement is the MODEL, because preflight() sha256's it before binding: a
+# unit installed without it just sits in a restart loop until the start limit
+# trips, which is a confusing way to learn about a missing file. So stop HERE,
+# before the unit is installed, and say exactly what to fetch.
+#
+# scorer/py/ provides jevreadout.py, which service.py imports at module level --
+# without it the app dies with ModuleNotFoundError: No module named
+# 'jevreadout'. That is also a hard stop, not a warning.
+say "== preflight: model + scorer python module"
+
+if ! ls "$SRC"/assets/*.gguf >/dev/null 2>&1; then
+    cat >&2 <<EOF
+install: MISSING MODEL. $SRC/assets has no .gguf file, and the service's
+          preflight refuses to bind without one (it sha256-verifies it).
+
+Fetch it (needs the huggingface CLI):
+
+    hf download chaoliangUNSW/Jev-Style-0.8B-Decision-v3-GGUF --local-dir $SRC/assets \\
+      "Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf" tokenizer/tokenizer.json readout_config.json
+
+or point the service at an existing copy with JEV_GGUF -- put it in
+~/.config/jev-local/env:
+
+    JEV_GGUF=/path/to/Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf
+
+(Nothing was installed. Fix the model, then re-run this installer.)
+EOF
+    exit 1
 fi
-ln -s "$SRC/extension" "$EXT_DIR"
-say "   $EXT_DIR -> $(readlink "$EXT_DIR" 2>/dev/null || echo "$SRC/extension")"
+say "   model: $(ls "$SRC"/assets/*.gguf | head -1)"
+
+if [ ! -f "$SRC/scorer/py/jevreadout.py" ]; then
+    # The dev tree is a legitimate home for this module (it is where the service
+    # looks second), so point at it as a convenience -- but do NOT symlink it
+    # silently: a link into someone's working tree is a trap the next rebuild
+    # will spring.
+    _HINT=""
+    for _cand in "$HOME/work/jev/scorer/py" "$HOME/jev/scorer/py"; do
+        if [ -f "$_cand/jevreadout.py" ]; then
+            _HINT="   (this machine has it at $_cand; the service finds it
+    automatically if JEV_SCORER_PY points there, or just copy/symlink it.)"
+            break
+        fi
+    done
+    cat >&2 <<EOF
+install: MISSING SCORER MODULE. $SRC/scorer/py/jevreadout.py not found, and
+          service.py imports it at module level, so the service cannot start.
+$_HINT
+
+The reference source lives in the scorer's own repository; see the scorer
+section of $SRC/README.md.
+
+(Nothing was installed. Fix the module, then re-run this installer.)
+EOF
+    exit 1
+fi
+say "   scorer module: $SRC/scorer/py/jevreadout.py"
+
+# ---- 3. link the extension so omp discovers it --------------------------------
+# BUG (found live, silent): a bare `ln -s` into node_modules is NOT enough.
+# getEnabledPlugins (packages/coding-agent/src/extensibility/plugins/loader.ts:244)
+# takes the union of package.json#dependencies and omp-plugins.lock.json#plugins,
+# and a lockfile-only entry is kept ONLY when the node_modules entry is a symlink
+# (loader.ts:169). A bare ln -s writes no lockfile entry, so the plugin is
+# filtered out as a "stale lockfile entry" and never loads -- `omp plugin list`
+# does not show it and the provider is never registered, with no error anywhere.
+#
+# `omp plugin link <path>` is the supported path: it writes BOTH the symlink and
+# the lockfile entry (manager.ts:902-956). It is idempotent -- it rm -rf's the
+# link path and re-creates it -- verified by running it three times on this box
+# and diffing the lockfile byte-for-byte. It also requires the extension's
+# package.json to carry a "name", which extension/package.json does.
+say "== linking extension for omp ($EXT_DIR)"
+
+if command -v omp >/dev/null 2>&1; then
+    say "   omp found on PATH: using 'omp plugin link' (writes the lockfile entry)"
+    # From the extension's own directory, so the lockfile records an absolute
+    # path rather than a relative one (manager.link resolves against cwd).
+    if (cd "$SRC/extension" && omp plugin link .) >/dev/null 2>&1; then
+        say "   $EXT_DIR -> $(readlink "$EXT_DIR" 2>/dev/null || echo '(see omp')"
+        say "   lockfile: $HOME/.omp/plugins/omp-plugins.lock.json now records $(basename "$EXT_DIR")"
+    else
+        say "   WARNING: 'omp plugin link' failed; falling back to a bare symlink."
+        say "   The extension MAY not be discovered -- verify with: omp plugin list"
+        mkdir -p "$(dirname "$EXT_DIR")"
+        rm -rf "$EXT_DIR"
+        ln -s "$SRC/extension" "$EXT_DIR"
+        say "   $EXT_DIR -> $SRC/extension"
+    fi
+else
+    # No omp binary: the symlink is still correct and the extension works once
+    # omp is installed and `omp plugin link` is run. Say so loudly, because this
+    # is exactly the silent-no-load case above.
+    say "   WARNING: 'omp' is not on PATH, so the lockfile entry cannot be written."
+    say "   The symlink is in place, but omp will NOT load this extension until"
+    say "   you run:  omp plugin link $SRC/extension"
+    say "   Then verify with: omp plugin list"
+    mkdir -p "$(dirname "$EXT_DIR")"
+    if [ -L "$EXT_DIR" ] || [ -d "$EXT_DIR" ]; then
+        rm -rf "$EXT_DIR"
+    fi
+    ln -s "$SRC/extension" "$EXT_DIR"
+    say "   $EXT_DIR -> $SRC/extension"
+fi
 
 # ---- 4. install the systemd --user unit ---------------------------------------
 # The committed unit uses %h and a documented default of ~/.local/share/jev-local.
@@ -73,6 +176,23 @@ say "   $EXT_DIR -> $(readlink "$EXT_DIR" 2>/dev/null || echo "$SRC/extension")"
 # the installed copy pins ExecStart's WorkingDirectory and run.sh path to the
 # checkout that was actually installed -- a unit pointing at a deleted directory
 # is worse than no unit. The committed file itself never carries an absolute path.
+#
+# ---- MemoryMax: measured here, not carried in the repo -----------------------
+# The committed unit has no MemoryMax line, on purpose: a ceiling measured on one
+# box is exactly what a public repo must not hard-code. systemd cannot take it
+# from an env file either -- MemoryMax=${VAR} is rejected with
+# "Invalid memory limit, ignoring" and silently becomes infinity (verified on
+# systemd 262 with a probe unit), because size-parsing directives are evaluated
+# before the environment is applied. So the number is generated HERE, from this
+# machine's own measurement.
+#
+# The cgroup counter is what MemoryMax is enforced against, and it runs ~500 MiB
+# BELOW the ps VmHWM sum: the scorer's Private_Clean pages (the tail of the 505
+# MiB GGUF) are evictable and the kernel drops them first. Sizing off ps RSS is
+# therefore ~1.5x too loose, and sizing off memory.peak alone ignores the ~73 MiB
+# kernel charge (stacks, page tables, slab) that ps cannot see. So: peak +
+# 73 MiB, then a generous allowance for those file-backed pages coming back under
+# external pressure, rounded up to a whole multiple of 16 MiB.
 say "== installing systemd user unit $UNIT_NAME"
 
 if command -v systemctl >/dev/null 2>&1; then
@@ -80,6 +200,12 @@ if command -v systemctl >/dev/null 2>&1; then
     # Substitute the repo's documented default paths with the real install path.
     # sed, not a hardcoded path: the committed unit stays relocatable, and this
     # substitution is what pins the live unit to this checkout.
+    #
+    # The pattern is exact enough to be safe: it matches only the install root
+    # "%h/.local/share/jev-local". The unit's override file path is
+    # "%h/.config/jev-local/env" (.config, not .local/share), which the pattern
+    # does not touch -- so a relocating install leaves the EnvironmentFile knob
+    # pointing at the user's real env file. Verified by substitution before commit.
     UNIT_TMP="$UNIT_DEST.tmp.$$"
     sed -e "s|%h/.local/share/jev-local|$SRC|g" "$SRC/systemd/$UNIT_NAME" > "$UNIT_TMP"
     # Verify the resulting unit is at least syntactically loadable before it is put
@@ -91,13 +217,53 @@ if command -v systemctl >/dev/null 2>&1; then
     else
         # verify is advisory, not authoritative: it cannot resolve %h or the
         # runtime-only paths, so a failure here is reported but does not block.
-        # (Verified on systemd 262: `systemd-analyze verify` on the committed unit
-        # exits 0 with no output once the paths exist.)
         mv "$UNIT_TMP" "$UNIT_DEST"
         say "   installed $UNIT_DEST (systemd-analyze verify had warnings; see 'journalctl --user -xe')"
     fi
     systemctl --user daemon-reload
     say "   systemctl --user daemon-reload: ok"
+
+    # Size MemoryMax from this machine's cgroup, then re-inject it into the file.
+    # Only done AFTER a start: before the first run there is no peak to measure,
+    # and a peak read off a dead unit would be meaningless.
+    _peak_bytes=""
+    if systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+        _peak_bytes=$(systemctl --user show "$UNIT_NAME" -p MemoryPeak --value 2>/dev/null || echo 0)
+    fi
+    case "$_peak_bytes" in
+        ''|*[!0-9]*) _peak_bytes=0 ;;
+    esac
+    if [ "$_peak_bytes" -gt 0 ] 2>/dev/null; then
+        # peak(MiB, rounded up) + 73 MiB kernel charge + 474 MiB for evictable
+        # file pages returning under pressure, then rounded up to a 16 MiB step
+        # (512k pages; keeps the number tidy and never rounds a real peak DOWN).
+        _peak_mib=$(( (_peak_bytes + 1048575) / 1048576 ))
+        _ceiling=$(( _peak_mib + 73 + 474 ))
+        _ceiling=$(( (_ceiling + 15) / 16 * 16 ))
+        # Re-inject as a single authoritative line, immediately after the
+        # OOMPolicy=stop directive where the committed file's memory block ends,
+        # so a reader finds it next to the reasoning that produced it.
+        _injected="$UNIT_DEST.tmp.$$"
+        sed -e "s|^MemoryMax=.*||" -e "s|^# MemoryMax is generated.*||" \
+            -e "s|^# peak (memory.peak).*||" -e "s|^# Delete this line.*||" \
+            "$UNIT_DEST" | awk -v m="$_ceiling" '
+            { print }
+            /^OOMPolicy=stop$/ && !done {
+                print "# MemoryMax is generated by install.sh from this machine MEASURED cgroup"
+                print "# peak (memory.peak) + 73 MiB kernel charge + 474 MiB for evictable file pages."
+                print "# Delete this line to fall back to no limit; see the block above for the recipe."
+                printf "MemoryMax=%sM\n", m
+                done = 1
+            }' > "$_injected"
+        mv "$_injected" "$UNIT_DEST"
+        systemctl --user daemon-reload
+        say "   MemoryMax=${_ceiling}M (measured peak ${_peak_mib} MiB + 73 MiB kernel + 474 MiB file cache)"
+        say "   override it with: systemctl --user set-property $UNIT_NAME MemoryMax=<size>"
+    else
+        say "   no MemoryMax set: no cgroup peak available yet (service not started)."
+        say "   The unit runs unbounded. After it has served a request, set one with:"
+        say "       systemctl --user set-property $UNIT_NAME MemoryMax=<peak+512>M"
+    fi
     if systemctl --user enable --now "$UNIT_NAME" 2>/dev/null; then
         say "   systemctl --user enable --now $UNIT_NAME: ok"
     else

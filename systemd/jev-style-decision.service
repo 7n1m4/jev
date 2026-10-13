@@ -193,54 +193,91 @@ SyslogLevel=info
 Environment=PYTHONUNBUFFERED=1
 
 # ---- Memory ------------------------------------------------------------------
-# MemoryMax is deliberately NOT set in this committed file. It is a documented
-# omission, not an oversight, and the reason is that a ceiling is only as good as
-# the measurement behind it -- and a measurement made on ONE box, with ONE model
-# path and ONE worker count, is exactly what a public repo should not hard-code
-# for everybody else's machine. This comment therefore records the measurement
-# that DOES exist, so the number is available rather than guessed.
+# THE COMMITTED FILE CARRIES NO MemoryMax LINE. This is deliberate and it is not
+# an oversight: a ceiling is only as good as the measurement behind it, and a
+# number measured on one box with one model path and one worker count is exactly
+# what a public repo must not hard-code for everybody else's machine.
 #
-# Measured on this machine (7800X3D, systemd 262, JEV_WORKERS=1, model 505 MiB
-# and readout_config from the installed assets/), with the unit started and the
-# scorer pool up:
+# The operator who wants one gets it GENERATED AT INSTALL TIME instead:
+# install.sh measures the installed tree's cgroup after start-up and writes a
+#   MemoryMax=<computed>
+# line into the installed copy, so the number is measured on the machine that
+# will enforce it. The committed file stays portable; the installed file carries
+# the measurement. That keeps the repo as the source of truth for everything
+# except the one value that genuinely cannot be known before the first run.
 #
-#   python (MainPID)      VmRSS 203,948 kB (~199 MiB)   VmHWM 270,972 kB (~265 MiB)
-#   scorer child          VmRSS 1,234,140 kB (~1206 MiB)  VmHWM = VmRSS (already flat)
-#   cgroup memory.current  881.0 MiB at idle
-#   cgroup memory.peak     881.3 MiB (peak == idle right after startup; the
-#                          model load lands inside the scorer child)
-#   memory.events  high=0 max=0 oom=0 oom_kill=0
+# ── Why it cannot be an EnvironmentFile knob ──────────────────────────────────
+# Tried and disproved on systemd 262 with a throwaway probe unit:
+#     MemoryMax=${JEV_MEMORY_MAX}
+#     EnvironmentFile=-...env   # containing JEV_MEMORY_MAX=1600M
+# systemd-analyze verify reports
+#     Invalid memory limit '${JEV_MEMORY_MAX}', ignoring
+# and `systemctl --user show -p MemoryMax` returns infinity. Unlike ExecStart,
+# size-parsing directives do NOT get variable expansion -- they are parsed
+# before the environment is applied, and an unparseable value is silently
+# dropped rather than failing the unit. So MemoryMax must be substituted into
+# the file text, which is what install.sh does. (ExecStart's ${JEV_LOCAL_DIR}
+# DOES work -- verified live -- because command lines are expanded later.)
 #
-# The ~1.8 GiB between the two processes is NOT double-spending: the scorer's RSS
-# is dominated by pages shared with the model file, and the cgroup counter for
-# the pair is ~0.94 GiB, which is the number a MemoryMax would actually be
-# charged against. ps RSS is a *per-process* counter with no way to express that
-# sharing, which is why "python + scorer RSS" overstates a cgroup ceiling by ~2x.
+# ── The measurement install.sh replays, and the recipe ────────────────────────
+# Taken on this box (7800X3D, systemd 262, 1 worker), in the unit's OWN cgroup:
 #
-# Setting a bound is a legitimate operator choice and a good one on this box; the
-# reason it is not committed here:
-#   * the model is not vendored (505 MiB, fetched separately), so a fresh clone's
-#     footprint is a function of where the operator put the GGUF, not of this repo;
-#   * a ceiling sized for one box silently becomes too small on a machine whose
-#     malloc/glibc arena behaviour differs, and an over-tight limit turns a
-#     healthy unattended daemon into a start-limit-hit loop -- availability zero,
-#     which is a far worse failure than a slightly larger memory use.
-# To set one on a machine you control, size it off the cgroup counter, e.g. ~1.5x
-# the observed memory.current:
-#   systemctl --user edit jev-style-decision
-#   [Service]
-#   MemoryMax=1536M
-# (On this box that is ~1.6x the measured 881 MiB: enough headroom for a longer
-# state or a bigger score question, and still bounded.) Note the trap above:
-# do NOT size it off "python RSS + scorer RSS", which would be ~2x too high.
+#   PROCESS counters (ps / /proc/<pid>/status):
+#     python3 service.py   VmRSS  199-375 MiB   VmHWM  265-402 MiB
+#     jev-gguf-scores      VmRSS 1164-1205 MiB  VmHWM 1205-1236 MiB
+#     sum of VmHWM                              ~1470-1638 MiB
+#     smaps_rollup on the scorer: Pss 1201, Anonymous 702, Private_Clean 498 MiB
 #
-# OOMPolicy applies if a limit is ever added (by unit edit, as above, or by a
-# systemd-wide default). stop is right for this service -- being killed and
-# restarted into a clean state beats being throttled into a latency disaster,
-# which for a decision service means every judge request timing out rather than
-# failing fast. It has no effect while no limit is set, and is stated so the
-# policy is explicit rather than left to whatever default a future systemd picks.
+#   CGROUP counters (what MemoryMax is enforced against — the only ones that count):
+#     memory.current / memory.peak   1117 MiB
+#     memory.stat: anon 969.4 / file 0.0 / kernel 72.8 / slab 0.3 MiB
+#     (969.4 + 0.0 + 72.8 = 1042.2, matching memory.current to the rounding)
+#     memory.events: high=0 max=0 oom=0 oom_kill=0, unchanged after 8
+#     concurrent 3-question requests
+#
+# The two disagree, and the direction is the whole lesson: the cgroup number is
+# ~500 MiB BELOW the VmHWM sum. ps RSS/VmRSS is a *process* counter over one
+# PID's page tables; VmHWM still counts pages since reclaimed or swapped out.
+# cgroup memory.current is anon + file + kernel, decomposed exactly by
+# memory.stat, and is the only thing MemoryMax sees. Here the scorer's 498 MiB
+# of Private_Clean pages (the tail of the 505 MiB GGUF, read in and never
+# written) are precisely the pages the kernel drops and re-faults first under
+# pressure. So:
+#   * sizing off ps numbers (VmHWM sum) is ~1.5x too loose;
+#   * sizing off memory.peak alone ignores the ~73 MiB kernel charge (kernel
+#     stacks, page tables, slab) that ps cannot see at all — and that is also
+#     where zswap-compressed pages land on a box with swap (this one has
+#     zpool/zstd and swappiness=100).
+# The arithmetic that produced the 1664 MiB on this box:
+#     memory.peak observed                       1117 MiB
+#   + kernel/ps-invisible charge allowance         73 MiB
+#   + file-cache pages coming back under pressure 474 MiB
+#                                                        --------
+#                                                        1664 MiB
+# ~10.6% of this machine's 15.7 GB, so the protective intent stands: it bounds a
+# runaway (a second worker, a scoring loop, a request storm) but cannot fire on a
+# healthy daemon. An unattended service killed into a start-limit-hit loop by an
+# over-tight limit has availability zero, which is a far worse failure than a
+# slightly larger ceiling. The bound that actually matters is JEV_WORKERS=1
+# above, which caps the scorer side at one such process.
+#
+# Recompute on another box with:
+#     systemctl --user show jev-style-decision -p MemoryPeak -p MemoryCurrent
+#     cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service\
+# /app.slice/jev-style-decision.service/memory.stat
+# (read memory.peak's value in bytes, size the ceiling off it, not off ps RSS).
+#
+# No MemoryMin, and that is a decision rather than an omission: this is bounding,
+# not reserving. A protected floor would bias the kernel into keeping this
+# cgroup's pages resident under pressure and away from the desktop, which is the
+# opposite of what the user wants. The ceiling is the whole mechanism.
 OOMPolicy=stop
+# OOMPolicy applies when a limit exists: kill the service and restart it into a
+# clean state, rather than throttling it into a latency disaster. For a decision
+# service "throttled" means every judge request timing out instead of failing
+# fast and visibly. With no MemoryMax in the committed file it has no effect
+# until install.sh adds one, and is stated so the policy is explicit rather than
+# left to whatever default a future systemd picks.
 
 # ---- CPU-only guarantee (from the repo's own contract) -----------------------
 # This unit sets no device variable and passes no backend flag, because the

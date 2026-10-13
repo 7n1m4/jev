@@ -80,6 +80,18 @@ if (calls.length === 1) {
 	check("baseUrl is loopback", /^https?:\/\/127\.0\.0\.1:\d+$/.test(config.baseUrl ?? ""),
 		config.baseUrl);
 	check("authHeader disabled", config.authHeader === false, String(config.authHeader));
+	// Regression guards for the fatal-load bug: ModelRegistry.registerProvider()
+	// validates through validateProviderConfiguration() in "runtime-register" mode
+	// (packages/coding-agent/src/config/models-config.ts:77-88), which THROWS when a
+	// provider declaring custom models has neither apiKey nor oauth. Without this
+	// the whole extension failed to load and no provider was registered at all.
+	// The value is a placeholder, NOT a secret, and it never reaches a request
+	// because authHeader is false (see above) and the service ignores that header.
+	check("apiKey placeholder present (runtime-register mode requires apiKey or oauth)",
+		typeof config.apiKey === "string" && config.apiKey.length > 0,
+		`apiKey=${JSON.stringify(config.apiKey)}`);
+	check("apiKey is the local placeholder, not a real credential",
+		config.apiKey === "local", JSON.stringify(config.apiKey));
 	check("exactly one model registered", Array.isArray(config.models) && config.models.length === 1,
 		config.models?.length);
 	const m = config.models?.[0];

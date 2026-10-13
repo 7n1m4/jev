@@ -1,0 +1,291 @@
+[Unit]
+Description=Jev-Style-0.8B-Decision-v3 -- local CPU-only decision service (oh-my-pi typesafe judge)
+Documentation=file:%h/.local/share/jev-local/README.md
+# The service is a local decision scorer for the coding agent's judge role. It is
+# started after the filesystem is writable and the session is up.
+#
+# Deliberately NOT After/Wants=network-online.target: everything it needs is on
+# this box -- a GGUF in ~/.local/share/jev-local/assets and a locally built
+# scorer -- so it never dials out, and ordering after network-online would let a
+# slow DHCP hold up a start that has no network dependency at all.
+After=local-fs.target default.target
+Wants=local-fs.target
+
+# ---- Start limit (the crash-loop brake) -------------------------------------
+# These are per-unit settings and therefore belong to [Unit], not [Service]:
+# systemd ignores them in [Service] silently (systemd-analyze verify warns), so
+# putting them here is the placement that actually takes effect.
+#
+# systemd's default is burst=5 within interval=10s. That is too tight here
+# because the expensive event in this unit's life is a preflight that takes
+# minutes, not seconds: preflight() sha256's the whole 505 MiB model and then
+# runs a live scorer probe. Ruled out by measurement / source inspection:
+#   * graceful starts do happen -- the in-development dev tree plus this repo
+#     resolve at import time and a missing file only fails at *request* time
+#     (service.py has no such path at startup), so the only hard preflight
+#     failures (model missing / sha256 mismatch) are a broken install;
+#   * a hard failure is deterministic, so restarting it quickly is pure noise.
+# So the interval is stretched to comfortably exceed the accumulated restart
+# delays below, leaving room for a slow-but-fine start to never be blamed.
+#
+# 300s / burst 5, chosen against this unit's own restart ladder, derived below:
+#   * one bad start costs RestartSec 10s + 20s + 40s + 80s = 150s of delay
+#     before the 5th attempt, so the interval must be > 150s to let all 5 real
+#     attempts happen at all;
+#   * the preflight's own work (model hash + scorer probe) is O(seconds) on a
+#     healthy install, so 300s gives >2x margin over the worst ladder.
+# After the 5th failure the unit enters failed state and STAYS there until a
+# human, a timer or a reboot resets it. That is the point: the box stops
+# churning and the operator's attention is the intended recovery path.
+StartLimitIntervalSec=300s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Written as %h (systemd's "the user's home directory") rather than
+# /home/vi/...: the unit is committed to a public repo, install.sh clones into
+# ~/.local/share/jev-local, and %h expands at runtime to the invoking user's
+# home, so the same file works for any user on any machine. systemd-analyze
+# verify accepts %h in WorkingDirectory/ExecStart (verified against systemd 262
+# on this machine), and install.sh's systemctl enable --now call is what makes
+# the expansion happen against a real, existing path.
+#
+# The working directory is set even though the service resolves every path
+# itself (HERE/REPO_ROOT are derived from __file__ in service.py, and the model,
+# scorer binary and readout_config are all repo-relative with env overrides).
+# It is set so any incidental relative-path write, or a cwd-relative crash/core
+# dump, lands in the repo instead of in /.
+WorkingDirectory=%h/.local/share/jev-local
+
+# ---- ExecStart ---------------------------------------------------------------
+# run.sh is the repo's own entry point: it cds into service/ and execs
+# `python3 service.py "$@"`, so the service keeps its documented startup contract
+# (including forwarding arguments) instead of the unit re-implementing it.
+#
+# The trap this avoids: `python3 <path>/run.sh` is NOT equivalent -- run.sh is a
+# /bin/sh script, so python3 would try to parse it and die with a SyntaxError on
+# line 8 ("cd \"$(dirname \"$0\")\""). Verified live against systemd 262: that
+# exact form failed with "Main process exited, code=exited, status=1/FAILURE"
+# and a python traceback in the journal. The script is executed, not interpreted.
+#
+# JEV_WORKERS=1 and JEV_PORT=61021 are set explicitly on the env command line
+# rather than left to the code's defaults (2 and 61021):
+#   * JEV_WORKERS=1 -- each worker is a separate scorer *subprocess* holding its
+#     own copy of the model's runtime state, and service/README.md measured
+#     ~1.2 GiB peak RSS per scorer process on this box. The service's throughput
+#     bound is not concurrency: it is one thread of matrix multiply per request
+#     (service/README.md measures a single request at 139 ms), and the judge role
+#     sends one decision at a time, rarely. Extra workers buy contention and
+#     memory, not latency. MemoryMax is deliberately not set (below), so pinning
+#     one scorer here is the only place the footprint is bounded.
+#   * JEV_PORT=61021 -- stated so a silent default change upstream cannot move
+#     the service off the port the extension and every curl example depend on.
+#     It matches DEFAULT_PORT in service.py, and the port is chosen above the
+#     box's ephemeral range (comment below).
+#
+# These are passed via /usr/bin/env on the command line rather than with
+# Environment=, and that is deliberate: systemd applies Environment= vars in
+# unit-file order, and an EnvironmentFile= appearing LATER in the file overrides
+# an Environment= that came before it (verified empirically on this machine with
+# systemd 262: a probe unit with Environment=FLAG_REPO=x followed by
+# EnvironmentFile=-...env yielded FLAG_REPO=y from the file). Passing the values
+# on the env command line makes them win regardless, so the override contract
+# documented under "Path / model overrides" is honest: JEV_GGUF and JEV_SCORER_DIR
+# are meant to be overridden, JEV_WORKERS/JEV_PORT are pinned.
+#
+# The unit does NOT set JEV_GGUF: the model lives in the repo's assets/ and
+# service.py's default resolution finds it. The documented override is the
+# EnvironmentFile below.
+ExecStart=/usr/bin/env JEV_WORKERS=1 JEV_PORT=61021 %h/.local/share/jev-local/service/run.sh
+
+# ---- Path / model overrides -------------------------------------------------
+# Optional, absent by default (the leading '-' makes a missing file a non-error,
+# so the unit runs identically on a machine that never creates it).
+#
+# Use it for the two paths that legitimately differ per machine: where the 505
+# MiB GGUF is, and where the scorer binary is. Everything else is repo-relative.
+#
+# Create it as ~/.config/jev-local/env, in KEY=VALUE form, one per line:
+#   JEV_GGUF=/home/you/.cache/huggingface/.../Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf
+#   JEV_SCORER_DIR=/home/you/.local/share/jev-local/scorer
+#
+# Because the Environment= values above are applied before this file, a
+# JEV_WORKERS or JEV_PORT line here WOULD take effect (later assignment wins),
+# but doing so is unsupported: the unit's memory and concurrency expectations are
+# written around one worker. JEV_GGUF / JEV_SCORER_DIR / JEV_SCORER_BIN are the
+# intended use.
+EnvironmentFile=-%h/.config/jev-local/env
+
+# A user drop-in can always reset ExecStart, and that is the supported way to
+# point the unit at a different checkout entirely:
+#   systemctl --user edit jev-style-decision
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/env ... /some/other/checkout/service/run.sh
+# (an empty ExecStart= first is required: systemd replaces rather than appends
+# ExecStart, so without the reset both would be queued and the last wins.)
+# Verified on systemd 262 with a probe unit.
+
+# ---- Restart policy ----------------------------------------------------------
+# on-failure, NOT always:
+#   * always would also restart a clean exit 0, and an exit 0 after a start is
+#     not distinguishable from "the work finished", so it would turn an operator
+#     stop into a restart loop.
+#   * on-failure covers exactly what this service can hit: the preflight's
+#     SystemExit(2) with a precise reason (model missing, sha256 mismatch,
+#     readout_config missing/wrong format, scorer binary missing, scorer probe
+#     failure -- all in service.py), a crash in the scorer pool, and the OOM
+#     killer. Preflight failures are the common case and they are the reason
+#     this value is needed at all.
+#   * on-abnormal is not enough: it would miss the preflight's clean exit 2.
+Restart=on-failure
+# Graduated backoff. A flat RestartSec=5 would let a hard-down service churn the
+# box at 12 attempts/minute forever; this linear ramp (10s, 20s, 40s, 80s, then
+# held at 80s) means the 5 attempts cost ~150s in total delay, so something
+# genuinely broken takes ~30x longer to heat the machine up and reaches the
+# start limit quietly. The ramp starts at 10s rather than 5s because the
+# service's own startup already includes a live scorer probe, i.e. seconds of
+# work before the port binds, and restarting sooner than that can only overlap
+# the previous attempt's own shutdown.
+RestartSec=10s
+RestartSteps=5
+RestartMaxDelaySec=80s
+
+# ---- Stop timeout ------------------------------------------------------------
+# The service holds no open device handle, but it does hold scorer *subprocesses*
+# on a JSON-lines stdin/stdout protocol (service/pool.py), and uvicorn waits for
+# in-flight requests before its shutdown hook runs. systemd's 90s default is
+# left explicit here rather than raised: nothing in this service is measured to
+# need more, and the fastapi/uvicorn versions on this machine shut down
+# cleanly, so bounding it explicitly rather than inheriting a default keeps the
+# unit's behaviour pinned to a documented value.
+TimeoutStopSec=90s
+
+# ---- Logging -----------------------------------------------------------------
+# journal is the only sink. Nothing is written to disk by the unit, so there is
+# no rotation to manage, and journald's own rate limiting protects the disk from
+# a crash-looping service.
+#
+# Both streams to the journal, interleaved, is what makes the preflight legible:
+# preflight() prints its per-check lines to stdout with explicit flush and its
+# FATAL line to stderr, so `journalctl --user -u jev-style-decision` answers
+# "what is broken?" -- including the sha256 mismatch case, which is exactly the
+# message an operator needs.
+#
+# PYTHONUNBUFFERED=1 so the preflight's flushed prints (and any traceback) are
+# not lost in a full buffer during a crash-loop, and so the ordering between
+# the service's own prints and uvicorn's access log is preserved.
+StandardOutput=journal
+StandardError=journal
+SyslogLevel=info
+Environment=PYTHONUNBUFFERED=1
+
+# ---- Memory ------------------------------------------------------------------
+# MemoryMax is deliberately NOT set in this committed file. It is a documented
+# omission, not an oversight, and the reason is that a ceiling is only as good as
+# the measurement behind it -- and a measurement made on ONE box, with ONE model
+# path and ONE worker count, is exactly what a public repo should not hard-code
+# for everybody else's machine. This comment therefore records the measurement
+# that DOES exist, so the number is available rather than guessed.
+#
+# Measured on this machine (7800X3D, systemd 262, JEV_WORKERS=1, model 505 MiB
+# and readout_config from the installed assets/), with the unit started and the
+# scorer pool up:
+#
+#   python (MainPID)      VmRSS 203,948 kB (~199 MiB)   VmHWM 270,972 kB (~265 MiB)
+#   scorer child          VmRSS 1,234,140 kB (~1206 MiB)  VmHWM = VmRSS (already flat)
+#   cgroup memory.current  881.0 MiB at idle
+#   cgroup memory.peak     881.3 MiB (peak == idle right after startup; the
+#                          model load lands inside the scorer child)
+#   memory.events  high=0 max=0 oom=0 oom_kill=0
+#
+# The ~1.8 GiB between the two processes is NOT double-spending: the scorer's RSS
+# is dominated by pages shared with the model file, and the cgroup counter for
+# the pair is ~0.94 GiB, which is the number a MemoryMax would actually be
+# charged against. ps RSS is a *per-process* counter with no way to express that
+# sharing, which is why "python + scorer RSS" overstates a cgroup ceiling by ~2x.
+#
+# Setting a bound is a legitimate operator choice and a good one on this box; the
+# reason it is not committed here:
+#   * the model is not vendored (505 MiB, fetched separately), so a fresh clone's
+#     footprint is a function of where the operator put the GGUF, not of this repo;
+#   * a ceiling sized for one box silently becomes too small on a machine whose
+#     malloc/glibc arena behaviour differs, and an over-tight limit turns a
+#     healthy unattended daemon into a start-limit-hit loop -- availability zero,
+#     which is a far worse failure than a slightly larger memory use.
+# To set one on a machine you control, size it off the cgroup counter, e.g. ~1.5x
+# the observed memory.current:
+#   systemctl --user edit jev-style-decision
+#   [Service]
+#   MemoryMax=1536M
+# (On this box that is ~1.6x the measured 881 MiB: enough headroom for a longer
+# state or a bigger score question, and still bounded.) Note the trap above:
+# do NOT size it off "python RSS + scorer RSS", which would be ~2x too high.
+#
+# OOMPolicy applies if a limit is ever added (by unit edit, as above, or by a
+# systemd-wide default). stop is right for this service -- being killed and
+# restarted into a clean state beats being throttled into a latency disaster,
+# which for a decision service means every judge request timing out rather than
+# failing fast. It has no effect while no limit is set, and is stated so the
+# policy is explicit rather than left to whatever default a future systemd picks.
+OOMPolicy=stop
+
+# ---- CPU-only guarantee (from the repo's own contract) -----------------------
+# This unit sets no device variable and passes no backend flag, because the
+# scorer cannot use a GPU:
+#   * the scorer hard-sets mp.n_gpu_layers = 0 (scorer/src/jev_scores.cpp), so it
+#     cannot offload even if asked to;
+#   * the shared libllama it links was configured with -DGGML_CUDA=OFF
+#     -DGGML_HIP=OFF -DGGML_VULKAN=OFF -DGGML_SYCL=OFF -DGGML_MUSA=OFF
+#     -DGGML_METAL=OFF, and build.sh fails the build if the binary links a GPU
+#     library or carries a GPU symbol;
+#   * so no CUDA_VISIBLE_DEVICES or equivalent is needed -- there is nothing
+#     here that could see a GPU. This box's card is a gaming GPU and is
+#     untouched by this service.
+# This also means the ProtectHome=read-only + ReadWritePaths=~/.cache/nvidia
+# dance that a Vulkan/GPU unit needs (keeping the driver's pipeline cache
+# writable or paying a full shader recompile per restart) is NOT applicable here
+# and is deliberately not copied.
+
+# ---- Other hardening ---------------------------------------------------------
+# NoNewPrivileges: the service has no reason to gain privileges; it reads a
+# world-readable model, runs a locally built binary, and binds a high port
+# (unprivileged, >1024) on loopback.
+NoNewPrivileges=yes
+
+# KillMode=mixed: SIGTERM first, so uvicorn's shutdown path runs and the pool's
+# scorer subprocesses are asked to quit cleanly over their JSON-lines protocol
+# (`{"cmd":"quit"}`), rather than being SIGKILLed mid-line and leaving a socket
+# or a half-written stream behind. The rest of the cgroup follows.
+KillMode=mixed
+
+# ProtectHome: read-only for $HOME. The reasoning, and why this is safe here
+# even though the model and repo also live under $HOME:
+#   * the service's own reads-under-$HOME are the model in ~/.local/share/jev-local/
+#     assets/ and the repo's python sources -- both read-only by nature, and
+#     ProtectHome=read-only permits reads;
+#   * the GPU-pipeline-cache rationale that forces ReadWritePaths under a Vulkan
+#     unit does not apply: this service links no GPU library and spawns no
+#     driver loader, so the nvidia shader cache fd's a Vulkan service keeps open
+#     simply do not exist here;
+#   * so unlike the GPU case, a read-only $HOME costs nothing and still stops an
+#     accidental write from a future code change from clobbering the user's files.
+ProtectHome=read-only
+
+# PrivateTmp=yes. What it costs and buys here, stated honestly rather than
+# inherited:
+#   * neither the service nor the scorer writes to /tmp (no tempfile use in the
+#     python, and the scorer's protocol is stdin/stdout), so nothing that works
+#     now can break;
+#   * it also gives the service a private mount namespace, which keeps a runaway
+#     request from being able to see or disturb another service's /tmp contents;
+#   * and, a practical one for the judge role: a decision service that keeps its
+#     own scratch space cannot be confused by stale files another user service
+#     left in /tmp.
+# The consequence worth knowing before debugging it: a `systemctl --user
+# stop/start` cycle sees a fresh /tmp each time, so nothing can be cached there.
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

@@ -278,6 +278,17 @@ that proves the install worked.
 The extension registers the `typesafe` provider with `baseUrl` pointing at
 `http://127.0.0.1:61021` (override with `JEV_BASE_URL`).
 
+It also ships an `apiKey: "local"` placeholder, and that line is load-bearing, not
+decoration: `registerProvider` calls `validateProviderConfiguration(…,
+"runtime-register")` (`packages/coding-agent/src/config/model-registry.ts:3449`)
+and a provider that declares custom models with neither `apiKey` nor `oauth` throws
+`Provider typesafe: "apiKey" or "oauth" is required when defining models`
+(`config/models-config.ts:77`). The provider is declared with `authHeader: false`,
+so the placeholder never goes out over the wire — it only satisfies the runtime's
+schema check. `extension/check_extension.mjs` asserts all three properties, so
+removing the placeholder fails loudly rather than silently un-loading the
+extension.
+
 ### Judge role: the one manual edit
 
 An extension cannot set the judge role — there is no `setJudge` on the extension

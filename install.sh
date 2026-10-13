@@ -408,7 +408,7 @@ Verify the service:
     curl -s http://127.0.0.1:61021/v1/models
 
 Uninstall:
-    systemctl --user disable --now $UNIT_NAME   # ignore the error if absent
+    systemctl --user disable --now $SVC_NAME   # ignore the error if absent
     rm -f $UNIT_DEST
     systemctl --user daemon-reload
     rm $EXT_DIR

@@ -163,11 +163,20 @@ systemctl --user daemon-reload
 systemctl --user enable --now jev-style-decision
 ```
 
-The committed unit is path-agnostic: it uses `%h` (systemd's home-directory
-specifier) and a documented default of `~/.local/share/jev-local`, which is what
-`install.sh` clones into. Installing from a checkout somewhere else
-(`JEV_LOCAL_DIR=/some/path`) is handled by the installer, which pins the
-installed copy to that path — the committed file never carries an absolute path.
+The committed unit is path-agnostic: it pins `Environment=JEV_LOCAL_DIR` to
+`~/.local/share/jev-local` (which is what `install.sh` clones into) and expands
+`${JEV_LOCAL_DIR}` in `ExecStart`, so pointing the unit at a different checkout is
+one line rather than editing the unit body:
+
+```sh
+systemctl --user edit jev-style-decision
+# [Service]
+# Environment=JEV_LOCAL_DIR=/some/other/checkout
+```
+
+Installing from a checkout somewhere else (`JEV_LOCAL_DIR=/some/path
+./install.sh`) is handled by the installer, which substitutes the path into the
+installed copy — the committed file itself never carries an absolute path.
 
 It runs `JEV_WORKERS=1 JEV_PORT=61021`: each scorer worker is a separate
 subprocess (~1.2 GiB RSS, see `service/README.md`), and the judge role sends one

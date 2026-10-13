@@ -17,23 +17,25 @@ Wants=local-fs.target
 # putting them here is the placement that actually takes effect.
 #
 # systemd's default is burst=5 within interval=10s. That is too tight here
-# because the expensive event in this unit's life is a preflight that takes
-# minutes, not seconds: preflight() sha256's the whole 505 MiB model and then
-# runs a live scorer probe. Ruled out by measurement / source inspection:
-#   * graceful starts do happen -- the in-development dev tree plus this repo
-#     resolve at import time and a missing file only fails at *request* time
-#     (service.py has no such path at startup), so the only hard preflight
-#     failures (model missing / sha256 mismatch) are a broken install;
-#   * a hard failure is deterministic, so restarting it quickly is pure noise.
-# So the interval is stretched to comfortably exceed the accumulated restart
-# delays below, leaving room for a slow-but-fine start to never be blamed.
+# because this unit's only realistic failure mode is a preflight that fails
+# deterministically (model missing, sha256 mismatch, scorer binary missing --
+# all in service.py, all a broken install rather than a transient), and
+# rapidly retrying a deterministic failure is pure noise. Ruled out by source
+# inspection:
+#   * the preflight is NOT a slow startup: its only real work is one sha256 over
+#     the 505 MiB GGUF plus one scorer probe. Measured live on this box, cold
+#     start to a listening socket is seconds, not minutes.
+#   * so the interval does not need to be long to accommodate slow starts; it is
+#     long so that the restart ladder below (10s + 20s + 40s + 80s = 150s of
+#     accumulated delay) can actually complete before the limit trips, giving
+#     the install 5 real attempts instead of being cut off mid-ladder.
 #
-# 300s / burst 5, chosen against this unit's own restart ladder, derived below:
-#   * one bad start costs RestartSec 10s + 20s + 40s + 80s = 150s of delay
-#     before the 5th attempt, so the interval must be > 150s to let all 5 real
-#     attempts happen at all;
-#   * the preflight's own work (model hash + scorer probe) is O(seconds) on a
-#     healthy install, so 300s gives >2x margin over the worst ladder.
+# 300s / burst 5, derived from this unit's own restart ladder:
+#   * one bad start costs 10s + 20s + 40s + 80s = 150s of delay before the 5th
+#     attempt, so the interval must be > 150s or the default 10s interval would
+#     kill the unit after its first failure and no ladder would ever be walked;
+#   * 300s is 2x that ladder, which leaves the whole ladder plus a slow start
+#     inside one window.
 # After the 5th failure the unit enters failed state and STAYS there until a
 # human, a timer or a reboot resets it. That is the point: the box stops
 # churning and the operator's attention is the intended recovery path.
@@ -56,6 +58,20 @@ Type=simple
 # scorer binary and readout_config are all repo-relative with env overrides).
 # It is set so any incidental relative-path write, or a cwd-relative crash/core
 # dump, lands in the repo instead of in /.
+#
+# JEV_LOCAL_DIR is pinned HERE, as an Environment= default, rather than being
+# written literally into ExecStart below. That is what makes the unit relocatable
+# without a drop-in: systemd expands ${JEV_LOCAL_DIR} in ExecStart against the
+# environment it has assembled at that point, so this Environment= line supplies
+# the default and an operator can replace the whole path with one line -- either
+# in the EnvironmentFile below or in `systemctl --user edit`:
+#   [Service]
+#   Environment=JEV_LOCAL_DIR=/some/other/checkout
+# Note that this is the one place a shell-style ${VAR} is relied on; it is safe
+# only because the variable is always defined above. If it were not, systemd
+# would refuse to start the unit at all, logging
+# "Referenced but unset environment variable evaluates to an empty string".
+Environment=JEV_LOCAL_DIR=%h/.local/share/jev-local
 WorkingDirectory=%h/.local/share/jev-local
 
 # ---- ExecStart ---------------------------------------------------------------
@@ -97,7 +113,7 @@ WorkingDirectory=%h/.local/share/jev-local
 # The unit does NOT set JEV_GGUF: the model lives in the repo's assets/ and
 # service.py's default resolution finds it. The documented override is the
 # EnvironmentFile below.
-ExecStart=/usr/bin/env JEV_WORKERS=1 JEV_PORT=61021 %h/.local/share/jev-local/service/run.sh
+ExecStart=/usr/bin/env JEV_WORKERS=1 JEV_PORT=61021 ${JEV_LOCAL_DIR}/service/run.sh
 
 # ---- Path / model overrides -------------------------------------------------
 # Optional, absent by default (the leading '-' makes a missing file a non-error,
@@ -110,22 +126,17 @@ ExecStart=/usr/bin/env JEV_WORKERS=1 JEV_PORT=61021 %h/.local/share/jev-local/se
 #   JEV_GGUF=/home/you/.cache/huggingface/.../Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf
 #   JEV_SCORER_DIR=/home/you/.local/share/jev-local/scorer
 #
-# Because the Environment= values above are applied before this file, a
-# JEV_WORKERS or JEV_PORT line here WOULD take effect (later assignment wins),
-# but doing so is unsupported: the unit's memory and concurrency expectations are
-# written around one worker. JEV_GGUF / JEV_SCORER_DIR / JEV_SCORER_BIN are the
-# intended use.
+# NOTE on precedence, since it is a real sharp edge: systemd applies Environment=
+# and EnvironmentFile= in unit-file order, and later assignments win. The
+# Environment=JEV_LOCAL_DIR=... default above therefore applies, and a
+# JEV_LOCAL_DIR line in the EnvironmentFile below would REPLACE it -- which is
+# the supported way to relocate the service to another checkout:
+#   JEV_LOCAL_DIR=/some/other/checkout
+# JEV_WORKERS/JEV_PORT are NOT overridable from that file: they are passed on the
+# env command line, whose values beat any EnvironmentFile assignment. That is
+# deliberate (see the ExecStart comment) and keeps the unit's one-worker memory
+# contract intact.
 EnvironmentFile=-%h/.config/jev-local/env
-
-# A user drop-in can always reset ExecStart, and that is the supported way to
-# point the unit at a different checkout entirely:
-#   systemctl --user edit jev-style-decision
-#   [Service]
-#   ExecStart=
-#   ExecStart=/usr/bin/env ... /some/other/checkout/service/run.sh
-# (an empty ExecStart= first is required: systemd replaces rather than appends
-# ExecStart, so without the reset both would be queued and the last wins.)
-# Verified on systemd 262 with a probe unit.
 
 # ---- Restart policy ----------------------------------------------------------
 # on-failure, NOT always:

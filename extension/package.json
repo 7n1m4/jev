@@ -1,0 +1,14 @@
+{
+  "name": "jev-local",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Point oh-my-pi's typesafe judge provider at a local CPU-only Jev-Style 0.8B decision service",
+  "type": "module",
+  "main": "index.ts",
+  "omp": {
+    "extensions": ["index.ts"]
+  },
+  "pi": {
+    "extensions": ["index.ts"]
+  }
+}

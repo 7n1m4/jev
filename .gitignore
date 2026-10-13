@@ -1,0 +1,9 @@
+# never commit the 505 MiB model or a llama.cpp checkout
+assets/
+llama.cpp/
+scorer/llama.cpp/
+__pycache__/
+*.pyc
+*.log
+# built by scorer/build.sh; the repo rebuilds it from source
+scorer/jev-gguf-scores

@@ -86,6 +86,31 @@ EOF
 fi
 say "   model: $(ls "$SRC"/assets/*.gguf | head -1)"
 
+# tokenizer.json is a SEPARATE silent failure from the two above, and it is worse
+# for being discovered late: the preflight checks the model's sha256 and the
+# readout config, both of which pass without it, so the unit starts and binds and
+# only the first real request fails -- with a 500 whose cause is
+# AttributeError: 'NoneType' object has no attribute 'encode', because
+# jevreadout._load_tokenizer() swallowed the exception and returned None
+# (scorer/py/jevreadout.py:421-428). Found by running a fresh clone end to end.
+# So check it here, where the operator can still see it.
+if [ ! -f "$SRC/assets/tokenizer/tokenizer.json" ]; then
+    cat >&2 <<EOF
+install: MISSING TOKENIZER. $SRC/assets/tokenizer/tokenizer.json not found.
+
+Without it the unit starts and binds, and then EVERY request fails with HTTP 500
+(AttributeError: 'NoneType' object has no attribute 'encode'), because the
+scorer's tokenizer loader fails silently. Fetch it with the same command:
+
+    hf download chaoliangUNSW/Jev-Style-0.8B-Decision-v3-GGUF --local-dir $SRC/assets \\
+      "Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf" tokenizer/tokenizer.json readout_config.json
+
+(Nothing was installed. Fix the tokenizer, then re-run this installer.)
+EOF
+    exit 1
+fi
+say "   tokenizer: $SRC/assets/tokenizer/tokenizer.json"
+
 if [ ! -f "$SRC/scorer/py/jevreadout.py" ]; then
     # The dev tree is a legitimate home for this module (it is where the service
     # looks second), so point at it as a convenience -- but do NOT symlink it
@@ -198,6 +223,25 @@ fi
 # kernel charge (stacks, page tables, slab) that ps cannot see. So: peak +
 # 73 MiB, then a generous allowance for those file-backed pages coming back under
 # external pressure, rounded up to a whole multiple of 16 MiB.
+#
+# !! HAZARD, and it is not hypothetical: this step once overwrote a LIVE unit's
+# file on disk. The running process was fine (systemd had already loaded the old
+# fragment), but the next restart would have started the wrong tree -- a
+# developer checkout instead of the install tree. So an existing unit that is
+# currently ACTIVE is never silently replaced: it is backed up, and the new one is
+# installed as `<unit>.new` for the operator to swap in. JEV_UNIT_DEST redirects
+# the whole destination, which is how a non-production install avoids all this.
+if [ -f "$UNIT_DEST" ] && systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+    _bak="$UNIT_DEST.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -p "$UNIT_DEST" "$_bak"
+    say "== $UNIT_NAME is ACTIVE right now -- not replacing it."
+    say "   existing unit backed up to: $_bak"
+    say "   new unit written to:      $UNIT_DEST.new"
+    UNIT_DEST="$UNIT_DEST.new"
+    UNIT_NAME="$UNIT_NAME.new"
+    say "   (rename it to $UNIT_NAME and 'systemctl --user restart' when ready,"
+    say "    or delete the .new file to keep the running one)"
+fi
 say "== installing systemd user unit $UNIT_NAME"
 
 if command -v systemctl >/dev/null 2>&1; then

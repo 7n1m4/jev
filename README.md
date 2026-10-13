@@ -60,17 +60,30 @@ Override with `JEV_PORT`. The bind address is hard-coded and not overridable.
 Preflight refuses to bind unless the sha256 matches exactly, so a truncated or
 substituted file can never be served.
 
-The GGUF is **not** vendored here (it is 505 MiB and belongs in a HF cache, not a
-git repo). Fetch it with:
+The model is **not** vendored here (it is 505 MiB and belongs in a HF cache, not
+a git repo), so a fresh clone is not runnable until you fetch it. Three files are
+required, and all three must come together:
 
 ```sh
 hf download chaoliangUNSW/Jev-Style-0.8B-Decision-v3-GGUF --local-dir ./assets \
   "Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf" tokenizer/tokenizer.json readout_config.json
 ```
 
-Then either keep it in `./assets/` (the default search path) or point `JEV_GGUF` at
-it. `readout_config.json` must sit alongside the GGUF; it carries the calibration
-temperature table the service needs.
+* `Jev-Style-0.8B-Decision-v3-Q4_K_M.gguf` — preflight refuses to bind unless its
+  sha256 matches exactly, so a truncated or substituted file can never be served.
+* `tokenizer/tokenizer.json` — **in the `tokenizer/` subdirectory**, not next to
+  the GGUF. Missing this is the quietest failure in the whole repo: the unit
+  starts and binds, then every request returns HTTP 500 with
+  `AttributeError: 'NoneType' object has no attribute 'encode'`, because the
+  scorer's tokenizer loader returns `None` on failure
+  (`scorer/py/jevreadout.py`).
+* `readout_config.json` — alongside the GGUF; carries the calibration temperature
+  table the service needs.
+
+Then either keep them in `./assets/` (the default search path) or point `JEV_GGUF`
+at the GGUF. `install.sh` checks for all three *before* it installs anything, so a
+misconfigured clone fails with the exact command rather than a unit in a restart
+loop.
 
 ## CPU-only guarantee
 

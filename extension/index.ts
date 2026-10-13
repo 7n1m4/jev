@@ -32,9 +32,32 @@ export default function (pi: ExtensionAPI) {
 	pi.registerProvider("typesafe", {
 		baseUrl: BASE_URL,
 		api: "typesafe",
-		// The local service is free and needs no key. `authHeader: false` keeps any
-		// Authorization header omp would otherwise add from a stale key out of the
-		// request; the service accepts any bearer anyway.
+		// The local service is free and needs no key, but the extension
+		// provider-registration contract REQUIRES one: ModelRegistry
+		// .registerProvider() validates through validateProviderConfiguration()
+		// in "runtime-register" mode (packages/coding-agent/src/config/
+		// models-config.ts:77-88), where a provider that declares custom models
+		// must supply `apiKey` or `oauth` or registration throws
+		//   Provider typesafe: "apiKey" or "oauth" is required when defining models.
+		// which is fatal -- the whole extension fails to load and no provider is
+		// registered at all.
+		//
+		// The literal is therefore a placeholder credential, NOT a secret. Two
+		// things keep it out of the request:
+		//   * `authHeader: false` below, so the config header resolver never
+		//     synthesizes an Authorization header (createConfigHeaderResolver
+		//     only emits one when authHeader === true AND apiKeyConfig is set
+		//     -- resolve-config-value.ts:193);
+		//   * the native judgment wire sends its OWN bearer, and ChainJudge
+		//     resolves that credential from the auth store, which this literal
+		//     populates so the judge chain's "no API key" branch is not taken
+		//     (packages/coding-agent/src/judgment/index.ts:338).
+		// The service ignores the Authorization header entirely, so a real
+		// value here would neither help nor hurt -- it exists purely to satisfy
+		// the registration contract.
+		apiKey: "local",
+		// Explicit, and redundant with the apiKey above only for a reader: no
+		// Authorization header is attached to any request.
 		authHeader: false,
 		models: [
 			{

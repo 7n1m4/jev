@@ -8,14 +8,14 @@
 #
 # What it does:
 #   1. clone or update the repo into ~/.local/share/jev-local (unless JEV_LOCAL_DIR)
-#   2. build the CPU-only scorer if the binary is missing
-#   2b. preflight: refuse to continue if the model or the scorer's python module
-#       is missing (both gitignored, both required, and a missing model would
-#       otherwise leave a systemd unit in a restart loop)
-#   3. link the extension with `omp plugin link`, which registers it in
+#   2. preflight: refuse to continue if the model or the scorer's python module
+#      is missing (both gitignored, both required) -- BEFORE the expensive build
+#   3. build the CPU-only scorer if the binary is missing
+#   4. link the extension with `omp plugin link`, which registers it in
 #      omp-plugins.lock.json -- a bare symlink is silently skipped by omp
-#   4. install + enable the systemd --user unit (if systemctl is available)
-#   5. print the one ~/.omp/agent/config.yml edit that routes the judge role here
+#   5. install + enable the systemd --user unit (if systemctl is available),
+#      writing a MemoryMax measured on THIS machine's cgroup
+#   6. print the one ~/.omp/agent/config.yml edit that routes the judge role here
 #
 # Idempotent: safe to run repeatedly. Never pushes, never installs system packages,
 # never touches a GPU, never fails if systemd is not present.
@@ -50,25 +50,15 @@ fi
 [ -f "$SRC/service/service.py" ]  || die "missing service/service.py in $SRC"
 [ -f "$SRC/extension/index.ts" ] || die "missing extension/index.ts in $SRC"
 
-# ---- 2. build the scorer (CPU only) if missing -------------------------------
-if [ -x "$SRC/scorer/jev-gguf-scores" ]; then
-    say "== scorer binary already present: $SRC/scorer/jev-gguf-scores"
-elif command -v c++ >/dev/null 2>&1 && command -v cmake >/dev/null 2>&1; then
-    say "== building CPU-only scorer (this clones llama.cpp and takes a few minutes)"
-    sh "$SRC/scorer/build.sh" || die 'scorer build failed'
-else
-    say "== SKIPPED scorer build: c++ or cmake not found."
-    say "   Install cmake + a C++ toolchain, then run: sh $SRC/scorer/build.sh"
-fi
-
-# ---- 2b. preflight: the pieces a fresh clone does NOT have --------------------
+# ---- 2. preflight: the pieces a fresh clone does NOT have --------------------
 # assets/, scorer/py/ and scorer/jev-gguf-scores are all gitignored on purpose
 # (the model is 505 MiB, the scorer is a build output, py/ is upstream source),
 # so a fresh clone can pass "git clone" and still be unrunnable. The hard
 # requirement is the MODEL, because preflight() sha256's it before binding: a
 # unit installed without it just sits in a restart loop until the start limit
 # trips, which is a confusing way to learn about a missing file. So stop HERE,
-# before the unit is installed, and say exactly what to fetch.
+# before anything expensive -- and specifically before the multi-minute scorer
+# build -- and say exactly what to fetch.
 #
 # scorer/py/ provides jevreadout.py, which service.py imports at module level --
 # without it the app dies with ModuleNotFoundError: No module named
@@ -123,7 +113,22 @@ EOF
 fi
 say "   scorer module: $SRC/scorer/py/jevreadout.py"
 
-# ---- 3. link the extension so omp discovers it --------------------------------
+# ---- 3. build the scorer (CPU only) if missing -------------------------------
+# Last of the cheap gates: now that the model and module are known present, spend
+# the minutes on the build. Without c++/cmake it is a warning, not a failure --
+# the service cannot score without it, but the extension and the unit are still
+# worth having, and the operator gets the exact command to run.
+if [ -x "$SRC/scorer/jev-gguf-scores" ]; then
+    say "== scorer binary already present: $SRC/scorer/jev-gguf-scores"
+elif command -v c++ >/dev/null 2>&1 && command -v cmake >/dev/null 2>&1; then
+    say "== building CPU-only scorer (this clones llama.cpp and takes a few minutes)"
+    sh "$SRC/scorer/build.sh" || die 'scorer build failed'
+else
+    say "== SKIPPED scorer build: c++ or cmake not found."
+    say "   Install cmake + a C++ toolchain, then run: sh $SRC/scorer/build.sh"
+fi
+
+# ---- 4. link the extension so omp discovers it --------------------------------
 # BUG (found live, silent): a bare `ln -s` into node_modules is NOT enough.
 # getEnabledPlugins (packages/coding-agent/src/extensibility/plugins/loader.ts:244)
 # takes the union of package.json#dependencies and omp-plugins.lock.json#plugins,
@@ -170,7 +175,7 @@ else
     say "   $EXT_DIR -> $SRC/extension"
 fi
 
-# ---- 4. install the systemd --user unit ---------------------------------------
+# ---- 5. install the systemd --user unit ---------------------------------------
 # The committed unit uses %h and a documented default of ~/.local/share/jev-local.
 # When installing from a checkout somewhere else (JEV_LOCAL_DIR/JEV_INSTALL_DIR),
 # the installed copy pins ExecStart's WorkingDirectory and run.sh path to the

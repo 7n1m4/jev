@@ -26,6 +26,7 @@ REPO_URL=${JEV_REPO_URL:-https://github.com/7n1m4/jev.git}
 INSTALL_DIR=${JEV_INSTALL_DIR:-$HOME/.local/share/jev-local}
 EXT_DIR=${JEV_EXT_DIR:-$HOME/.omp/plugins/node_modules/jev-local}
 UNIT_NAME=jev-style-decision.service
+SVC_NAME=$UNIT_NAME          # unit systemctl is asked about (differs when a .new name is installed)
 UNIT_DEST=${JEV_UNIT_DEST:-$HOME/.config/systemd/user/$UNIT_NAME}
 
 say()  { printf '%s\n' "$*"; }
@@ -224,13 +225,23 @@ fi
 # 73 MiB, then a generous allowance for those file-backed pages coming back under
 # external pressure, rounded up to a whole multiple of 16 MiB.
 #
-# !! HAZARD, and it is not hypothetical: this step once overwrote a LIVE unit's
-# file on disk. The running process was fine (systemd had already loaded the old
-# fragment), but the next restart would have started the wrong tree -- a
-# developer checkout instead of the install tree. So an existing unit that is
-# currently ACTIVE is never silently replaced: it is backed up, and the new one is
-# installed as `<unit>.new` for the operator to swap in. JEV_UNIT_DEST redirects
-# the whole destination, which is how a non-production install avoids all this.
+# !! HAZARD, and it is not hypothetical -- it happened during this installer's own
+# end-to-end test. Step 5 overwrote
+# ~/.config/systemd/user/jev-style-decision.service while the service was ACTIVE.
+# The running process survived (systemd had already loaded the old fragment), but
+# the file on disk then pointed ExecStart at the developer checkout, so the NEXT
+# restart would have started the wrong tree. So an existing unit that is active is
+# never silently replaced: it is backed up and the new one is written next to it
+# as `<unit>.new` for the operator to swap in. JEV_UNIT_DEST redirects the whole
+# destination, which is how a non-production install avoids all of this.
+#
+# UNIT_NAME is the name systemd is asked about; UNIT_SRC is the repo file it comes
+# from. They are deliberately separate, because the renamed .new unit is not a
+# repo filename.
+UNIT_SRC=jev-style-decision.service
+
+# The guard. Renames only the DESTINATION (and the name asked of systemctl), never
+# the repo filename, so the substitution below still reads a real file.
 if [ -f "$UNIT_DEST" ] && systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
     _bak="$UNIT_DEST.bak.$(date +%Y%m%d-%H%M%S)"
     cp -p "$UNIT_DEST" "$_bak"
@@ -238,14 +249,15 @@ if [ -f "$UNIT_DEST" ] && systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev
     say "   existing unit backed up to: $_bak"
     say "   new unit written to:      $UNIT_DEST.new"
     UNIT_DEST="$UNIT_DEST.new"
-    UNIT_NAME="$UNIT_NAME.new"
-    say "   (rename it to $UNIT_NAME and 'systemctl --user restart' when ready,"
-    say "    or delete the .new file to keep the running one)"
+    SVC_NAME="${UNIT_DEST##*/}"          # what systemctl is asked about from here on
+    say "   (rename it to $SVC_NAME and restart when ready, or delete it"
+    say "    to keep the running one)"
 fi
-say "== installing systemd user unit $UNIT_NAME"
+say "== installing systemd user unit $SVC_NAME"
 
 if command -v systemctl >/dev/null 2>&1; then
     mkdir -p "$(dirname "$UNIT_DEST")"
+    [ -f "$SRC/systemd/$UNIT_SRC" ] || die "missing systemd/$UNIT_SRC in $SRC"
     # Substitute the repo's documented default paths with the real install path.
     # sed, not a hardcoded path: the committed unit stays relocatable, and this
     # substitution is what pins the live unit to this checkout.
@@ -256,7 +268,7 @@ if command -v systemctl >/dev/null 2>&1; then
     # does not touch -- so a relocating install leaves the EnvironmentFile knob
     # pointing at the user's real env file. Verified by substitution before commit.
     UNIT_TMP="$UNIT_DEST.tmp.$$"
-    sed -e "s|%h/.local/share/jev-local|$SRC|g" "$SRC/systemd/$UNIT_NAME" > "$UNIT_TMP"
+    sed -e "s|%h/.local/share/jev-local|$SRC|g" "$SRC/systemd/$UNIT_SRC" > "$UNIT_TMP"
     # Verify the resulting unit is at least syntactically loadable before it is put
     # in place: a half-written unit file in ~/.config/systemd/user breaks every
     # --user command on the machine, not just this service.
@@ -276,8 +288,8 @@ if command -v systemctl >/dev/null 2>&1; then
     # Only done AFTER a start: before the first run there is no peak to measure,
     # and a peak read off a dead unit would be meaningless.
     _peak_bytes=""
-    if systemctl --user is-active --quiet "$UNIT_NAME" 2>/dev/null; then
-        _peak_bytes=$(systemctl --user show "$UNIT_NAME" -p MemoryPeak --value 2>/dev/null || echo 0)
+    if systemctl --user is-active --quiet "$SVC_NAME" 2>/dev/null; then
+        _peak_bytes=$(systemctl --user show "$SVC_NAME" -p MemoryPeak --value 2>/dev/null || echo 0)
     fi
     case "$_peak_bytes" in
         ''|*[!0-9]*) _peak_bytes=0 ;;
@@ -307,14 +319,14 @@ if command -v systemctl >/dev/null 2>&1; then
         mv "$_injected" "$UNIT_DEST"
         systemctl --user daemon-reload
         say "   MemoryMax=${_ceiling}M (measured peak ${_peak_mib} MiB + 73 MiB kernel + 474 MiB file cache)"
-        say "   override it with: systemctl --user set-property $UNIT_NAME MemoryMax=<size>"
+        say "   override it with: systemctl --user set-property $SVC_NAME MemoryMax=<size>"
     else
         say "   no MemoryMax set: no cgroup peak available yet (service not started)."
         say "   The unit runs unbounded. After it has served a request, set one with:"
-        say "       systemctl --user set-property $UNIT_NAME MemoryMax=<peak+512>M"
+        say "       systemctl --user set-property $SVC_NAME MemoryMax=<peak+512>M"
     fi
-    if systemctl --user enable --now "$UNIT_NAME" 2>/dev/null; then
-        say "   systemctl --user enable --now $UNIT_NAME: ok"
+    if systemctl --user enable --now "$SVC_NAME" 2>/dev/null; then
+        say "   systemctl --user enable --now $SVC_NAME: ok"
     else
         # A failing enable --now is expected when the model is not downloaded yet:
         # the unit's preflight sha256's the GGUF and exits 2, which Restart=on-failure
@@ -323,10 +335,10 @@ if command -v systemctl >/dev/null 2>&1; then
         say "   WARNING: the unit did not start (service start failed)."
         say "   Most likely the model is not downloaded yet -- see 'Fetch the model' below."
         say "   It is enabled and will start on next login; or start it after fetching:"
-        say "       systemctl --user start $UNIT_NAME"
+        say "       systemctl --user start $SVC_NAME"
         say "   Check the reason with:"
-        say "       systemctl --user status $UNIT_NAME"
-        say "       journalctl --user -u $UNIT_NAME -n 50 --no-pager"
+        say "       systemctl --user status $SVC_NAME"
+        say "       journalctl --user -u $SVC_NAME -n 50 --no-pager"
     fi
 else
     # No systemctl: say so, and give the exact manual steps. This is not an error:
@@ -334,9 +346,9 @@ else
     say "== systemctl not found -- skipping the systemd unit."
     say "   To install it manually, copy the unit and enable it:"
     say "       mkdir -p $HOME/.config/systemd/user"
-    say "       cp $SRC/systemd/$UNIT_NAME $UNIT_DEST"
+    say "       cp $SRC/systemd/$UNIT_SRC $UNIT_DEST"
     say "       systemctl --user daemon-reload"
-    say "       systemctl --user enable --now $UNIT_NAME"
+    say "       systemctl --user enable --now $SVC_NAME"
     say "   (On a machine without systemd, run $SRC/service/run.sh instead.)"
 fi
 
@@ -349,7 +361,7 @@ To verify:
     ls -l $EXT_DIR
 
 The decision service (loopback only, port 61021):
-    systemctl --user status $UNIT_NAME      # if the unit was installed
+    systemctl --user status $SVC_NAME      # if the unit was installed
     $SRC/service/run.sh                     # or just run it by hand
 
 --------------------------------------------------------------- !!! READ THIS !!!

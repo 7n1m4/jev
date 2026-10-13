@@ -7,9 +7,13 @@
  * path when the service is NOT running.
  */
 import { pathToFileURL } from "node:url";
-import { pathToFileURL as _p } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const EXT = process.argv[2] ?? "/home/vi/work/jev-local/extension/index.ts";
+// Resolve relative to this file, not an absolute path: the checker lives in the
+// repo, and a hardcoded home directory would make it fail on every fresh clone.
+const HERE = dirname(fileURLToPath(import.meta.url));
+const EXT = process.argv[2] ?? join(HERE, "index.ts");
 const BASE = process.env.JEV_BASE_URL ?? "";
 
 const calls = [];
